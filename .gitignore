@@ -1,0 +1,4 @@
+# ignore generated json files
+*.json
+# remove __pychache__
+__pycache__
