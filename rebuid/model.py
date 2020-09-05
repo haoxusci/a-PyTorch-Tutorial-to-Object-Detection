@@ -1,7 +1,7 @@
 from torch import nn
 import torch.nn.functional as F
 import torchvision
-from utils import decimate
+from utils import *
 import torch
 from math import sqrt
 
@@ -593,8 +593,146 @@ class SSD300(nn.Module):
         prior_boxes = torch.FloatTensor(prior_boxes).to(device)  # (8732, 4)
         # this does not ensure the box exceed the image yet.
         prior_boxes.clamp_(0, 1)
-
+        # (8732, 4)
         return prior_boxes
 
-    def detect_objects(self):
-        pass
+    def detect_objects(
+        self, predicted_locs, predicted_scores, min_score, max_overlap, top_k
+    ):
+        """
+        Decipherthe 8732 locations and class scores (output of the SSD300) to detect objects.
+
+        For each class, perform Non-Maximum Suppression (NMS) on boxes that are above a minimum threshold.
+
+        Parameters:
+            predicted_locs (Tensor):
+                predicted locations/boxes w.r.t the 8732 prior boxes, a tensor of dimension (N, 8732, 4)
+            predicted_scores (Tensor):
+                class scores for each of the encoded locations/boxes, a tensor of dimension (N, 8732, n_classes)
+            min_score:
+                minimum threhold for a box to be consiered a match for a certain class
+            max_overlap:
+                maximum overlap two boxes can have so that the one with the lower score is not suppressed via NMS
+            top_k: if there are a lot of resulting detection across all classes, keep only the top 'k'
+
+        Returns:
+            dtections (boxes, labels, scores). lists of length batch_size
+        """
+        batch_size = predicted_locs(0)  # N
+        n_priors = self.priors_cxcy.size(0)  # 8732
+        predicted_scores = F.softmax(predicted_scores, dim=2)
+        # (N, 8732, n_classes)
+
+        # Lists to store final predicted boxes, labels and scores forall images
+        all_images_boxes = list()
+        all_images_labels = list()
+        all_images_scores = list()
+
+        assert n_priors == predicted_locs.size(1) == predicted_scores.size(1)
+
+        for i in range(batch_size):
+            # in (minx, miny, maxx, maxy) format
+            decoded_locs = cxcy_to_xy(
+                gcxgcy_cxcy(predicted_locs[i], self.priors_cxcy)
+            )  # (8732, 4), fractional pt. coordinates
+
+            # Lists to store boxes and scores for this image
+            image_boxes = list()
+            image_labels = list()
+            image_scores = list()
+
+            # this line is useless thus masked out
+            # max_scores, best_label = predicted_scores[i].max(dim=1)
+            # (8732), (8732)
+            # Check for each class
+            for c in range(1, self.n_classes):
+                # Keep only predicted boxes and scores where scores for this class are above the minimum score
+                class_scores = predicted_scores[i][:, c]  # (8732)
+                score_above_min_score = class_scores > min_score  # torch.bool
+                n_above_min_score = score_above_min_score.sum().item()
+                if n_above_min_score == 0:
+                    continue
+                class_scores = class_scores[
+                    score_above_min_score
+                ]  # (n_qualified), < 8732
+                # should be pytorch autobroadcast here
+                class_decoded_locs = class_scores[score_above_min_score]
+                # (n_qualified, 4)
+
+                # sort predicted boxes adn scores by scores, decending
+                class_scores, sort_ind = class_scores.sort(
+                    dim=0, descending=True
+                )  # (n_qualified), (n_qualified)
+                class_decoded_locs = class_decoded_locs[
+                    sort_ind
+                ]  # (n_qualified, 4)
+
+                # Find the overlap between predicted boxes
+                overlap = find_jaccard_overlap(
+                    class_decoded_locs, class_decoded_locs
+                )  # (n_qualified, n_qualified)
+
+                # Non-Maximum Suppression (NMS)
+                # set a torch.uint8 (byte) tensor to keep track of which predicted boxes to suppress
+                # 1 implies suppress, 0 implies don't suppress
+                suppress = torch.zeros(
+                    (n_above_min_score), dtype=torch.uint8
+                ).to(
+                    device
+                )  # (n_qualified)
+
+                # Consider each box in order of decreasing scores
+                for box in range(class_decoded_locs):
+                    # leave it if already suppressed
+                    if suppress[box] == 1:
+                        continue
+                    overlap_above_max = torch.tensor(
+                        overlap[box] > max_overlap,
+                        dtype=suppress.dtype,
+                        device=suppress.device,
+                    )
+                    suppress = torch.max(suppress, overlap_above_max)
+                    # dont support itself, even though an overlap of 1
+                    suppress[box] = 0
+
+                # Store only unsuppressed boxes for this class
+                image_boxes(class_decoded_locs[1 - suppress])
+                image_label.append(
+                    torch.LongTensor((1 - suppress).sum().item() * [c]).to(
+                        device
+                    )
+                )
+                image_scores.append(class_scores[1 - suppress])
+
+            # If no object in any class is found, store a placeholder for 'background'
+            if len(image_boxes) == 0:
+                image_boxes.append(
+                    torch.FloatTensor([[0.0, 0.0, 1.0, 1.0]]).to(device)
+                )
+                image_labels.append(torch.LongTensor([0]).to(device))
+                image_scores.append(torch.FloatTensor([0.0]).to(device))
+            # concatenate into single tensors
+            image_boxes = torch.cat(image_boxes, dim=0)  # (n_objects, 4)
+            image_labels = torch.cat(image_labels, dim=0)  # (n_objects)
+            image_scores = torch.cat(image_scores, dim=0)  # (n_objects)
+            n_objects = image_scores.size(0)
+
+            # Keep only the top k objects
+            if n_objects > top_k:
+                image_scores, sort_ind = image_scores.sort(
+                    dim=0, descending=True
+                )
+                image_scores = image_scores[:top_k]  # (top_k)
+                image_boxes = image_boxes[sort_ind][:top_k]  # (top_k, 4)
+                image_labels = image_labels[sort_ind][:top_k]  # (top_k)
+
+            # Append to lists that store predicted boxes and scores for all images
+            all_images_boxes.append(image_boxes)
+            all_images_labels.append(image_labels)
+            all_images_scores.append(image_scores)
+
+        return (
+            all_images_boxes,
+            all_images_labels,
+            all_images_scores,
+        )  # lists of length batch_size, and each list corresponds to an image
