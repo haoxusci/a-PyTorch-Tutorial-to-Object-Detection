@@ -736,3 +736,133 @@ class SSD300(nn.Module):
             all_images_labels,
             all_images_scores,
         )  # lists of length batch_size, and each list corresponds to an image
+
+
+class MultiBoxLoss(nn.Module):
+    """
+    The MultiBox loss, a loss function for object detection.
+
+    This is a combination of:
+    (1) a localization loss for the predicted locations of the boxes, and
+    (2) a confidence loss for the predicted class scores.
+    """
+
+    def __init__(self, priors_cxcy, threhold=0.5, neg_pos_ratio=3, alpha=1.0):
+        super().__init__()
+        self.priors_cxcy = priors_cxcy
+        self.priors_xy = cxcy_to_xy(priors_cxcy)
+        self.threshold = threhold
+        self.neg_pos_ratio = neg_pos_ratio
+        self.alpha = alpha
+
+        self.smooth_l1 = nn.L1Loss()
+        self.cross_entropy = nn.CrossEntropyLoss(
+            reduction="none"
+        )  # return a loss per batch element
+
+    def forward(self, predicted_locs, predicted_scores, boxes, labels):
+        """
+        Forward propagation
+
+        Parameters:
+        predicted_locs (Tensor): predicted locations/boxes w.r.t the 8732 prior boxes, a tensor of dimension (N, 8732, 4)
+        predicted_scores (Tensor): class scores for each of the encoded locations/boxes, a tensor of dimension (N, 8732, n_classes)
+        boxes: true object bounding box in boundary coordinates, a list of N tensors. (N, (changing object number), 4) ??? it seems we will always pass a background label.
+        labels: true labels, a list of N tensor (N, (changing object number))
+
+        Returns:
+        multibox loss, a scalar
+        """
+
+        batch_size = predicted_locs.size(0)
+        n_priors = self.priors_cxcy.size(0)
+        n_classes = predicted_scores.size(2)
+
+        assert n_priors == predicted_locs.size(1) == predicted_scores.size(1)
+
+        true_locs = torch.zeros(
+            (batch_size, n_priors, 4), dtype=torch.float
+        ).to(
+            device
+        )  # (N, 8732, 4)
+        true_classes = torch.zeros(
+            (batch_size, n_priors), dtype=torch.long
+        ).to(
+            device
+        )  # (N, 8732)
+
+        # for each batch of images
+        for i in range(batch_size):
+            n_objects = boxes[i].size(0)  # (int)
+            overlap = find_jaccard_overlap(boxes[i], self.priors_cxcy)
+            # for each prior, find the object with maximum overlap
+            overlap_for_each_prior, object_for_each_prior = overlap.max(dim=0)
+            # (8732) (8732)
+            # We don't want a situation where an object is not represented in our positive (non-background) priors -
+            # 1. An object might not be the best object for all priors, and is therefore not in object_for_each_prior.
+            # 2. All priors with the object may be assigned as background based on the threshold (0.5).
+
+            _, prior_for_each_object = overlap.max(dim=1)
+            object_for_each_prior[prior_for_each_object] = torch.LongTensor(
+                range(n_objects)
+            ).to(device)
+            overlap_for_each_prior[prior_for_each_object] = 1.0
+
+            # assign label for each prior
+            # this part is only for confidence score calculation
+            label_for_each_prior = labels[i][object_for_each_prior]  # (8732)
+            label_for_each_prior[
+                overlap_for_each_prior < self.threshold
+            ] = 0  # (8732)
+
+            # Store
+            true_classes[i] = label_for_each_prior  # (8732)
+            true_locs[i] = cxcy_to_gcxgcy(
+                xy_to_cxcy(boxes[i][object_for_each_prior]), self.priors_cxcy
+            ) # (8732, 4) true loc for each image
+
+        positive_priors = true_classes != 0 # (N, 8732)
+        
+        loc_loss = self.smooth_l1(
+            predicted_locs[positive_priors], true_locs[positive_priors]
+        ) 
+
+        # CONFIDENCE LOSS
+        n_positives = positive_priors.sum(dim=0) #(N)
+        n_hard_negatives = self.neg_pos_ratio * n_positives  # (N)
+        # First, find the loss for all priors
+        conf_loss_all = self.cross_entropy(
+            predicted_scores.view(-1, n_classes), true_classes.view(-1)
+        )  # (N * 8732)
+        conf_loss_all = conf_loss_all.view(batch_size, n_priors)  # (N, 8732)
+        # We already know which priors are positive
+        conf_loss_pos = conf_loss_all[positive_priors]  # (sum(n_positives))
+        # Next, find which priors are hard-negative
+        # To do this, sort ONLY negative priors in each image in order of decreasing loss and take top n_hard_negatives
+        conf_loss_neg = conf_loss_all.clone()  # (N, 8732)
+        conf_loss_neg[
+            positive_priors
+        ] = 0.0  # (N, 8732), positive priors are ignored (never in top n_hard_negatives)
+        conf_loss_neg, _ = conf_loss_neg.sort(
+            dim=1, descending=True
+        )  # (N, 8732), sorted by decreasing hardness
+        hardness_ranks = (
+            torch.LongTensor(range(n_priors))
+            .unsqueeze(0)
+            .expand_as(conf_loss_neg)
+            .to(device)
+        )  # (N, 8732)
+        hard_negatives = hardness_ranks < n_hard_negatives.unsqueeze(
+            1
+        )  # (N, 8732)
+        conf_loss_hard_neg = conf_loss_neg[
+            hard_negatives
+        ]  # (sum(n_hard_negatives))
+        # As in the paper, averaged over positive priors only, although computed over both positive and hard-negative priors
+        conf_loss = (
+            conf_loss_hard_neg.sum() + conf_loss_pos.sum()
+        ) / n_positives.sum().float()  # (), scalar
+
+        # TOTAL LOSS
+
+        return conf_loss + self.alpha * loc_loss
